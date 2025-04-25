@@ -1,41 +1,18 @@
-// task.proto
 syntax = "proto3";
 
-package task;
-
-// Request message containing a Lua script and arguments, sent from client to master,
-// and from master to worker.
-message TaskRequest
-{
-    string task_id = 1;
-    string script = 2;
-    string args = 3;
-    // Used by master to route the response back to the correct client.
-    // In the master-to-worker request, this will be the string representation of the client's bufferevent pointer.
-    string client_id = 4;
+message TaskRequest {
+  string task_id = 1;
+  string script = 2;
+  bytes input = 3;   // any serial
 }
 
-// Response message containing the result of task execution, sent from worker to master,
-// and from master to client.
-message TaskResponse
-{
-    string task_id = 1;
-    string result = 2;
-    // Used by the master to identify which worker completed the task.
-    string worker_id = 3;
-    // Used by the master to route the response back to the correct client.
-    string client_id = 4;
+message TaskResult {
+  string task_id = 1;
+  bool success = 2;        
+  bytes output = 3;  
+  string error_message = 4; 
 }
 
-// Message sent by a worker to register with the master.
-message WorkerRegistration
-{
-    string worker_id = 1;
-}
-
-// Message sent by the master to acknowledge worker registration.
-message WorkerAcknowledgment
-{
-    string worker_id = 1;
-    string status = 2; // e.g., "registered", "error"
+message WorkerRegister {
+    string worker_id = 1; 
 }

@@ -1,1153 +1,651 @@
-#include <event2/event.h>
-#include <event2/buffer.h>
-#include <event2/bufferevent.h>
-#include <event2/listener.h>
-#include <arpa/inet.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <iostream>
-#include <string>
-#include <map>
 #include <vector>
-#include <queue>
+#include <string>
 #include <memory>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <atomic>
+#include <uv.h>
 #include <lua5.4/lua.hpp>
+#include "../build/src/task.pb.h"
+#include <vector>
+#include <mutex>
 
-#include "task.pb.h"
+// config
+const char *RUNNER_IP = "0.0.0.0";
+const int RUNNER_PORT = 7000;
+const char *WORKER_TARGET_IP = "127.0.0.1";
 
-// Structure for pending tasks
-struct PendingTask
+typedef struct
 {
-    std::string task_id;
-    std::string script;
-    std::string args;
-    struct bufferevent *client_bev; // To send response back to client
-};
+    char *base;
+    size_t len;
+} read_buf_t;
 
-// Structure for worker information
-struct Worker
+// Allocate buffer for libuv reads
+void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
 {
+    buf->base = (char *)malloc(suggested_size);
+    if (!buf->base)
+    {
+        buf->len = 0; // allocation fails
+        fprintf(stderr, "Runner/Worker: Failed to allocate buffer\n");
+        return;
+    }
+    buf->len = suggested_size;
+}
+
+struct RunnerClient
+{
+    uv_tcp_t handle;
     std::string id;
-    struct bufferevent *bev;
-    bool busy;
+    bool closing = false;
 };
 
-// Task Queue
-class TaskQueue
+struct RunnerState
 {
-public:
-    void pushTask(const PendingTask &task)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        tasks_.push(task);
-        cv_.notify_one();
-    }
-
-    bool waitAndPopTask(PendingTask &task)
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this]
-                 { return !tasks_.empty(); });
-        task = tasks_.front();
-        tasks_.pop();
-        return true;
-    }
-
-    size_t size()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return tasks_.size();
-    }
-
-private:
-    std::queue<PendingTask> tasks_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
+    std::vector<std::shared_ptr<RunnerClient>> workers;
+    size_t next_worker_index = 0; // round robin index
+    std::mutex workers_mutex;
+    uv_loop_t *loop = nullptr;
+    uv_tcp_t server_handle;
 };
 
-// Worker Manager
-class WorkerManager
+RunnerState runner_state;
+
+void on_runner_read(uv_stream_t *client_stream, ssize_t nread, const uv_buf_t *buf);
+void on_runner_close(uv_handle_t *handle); // Forward declaration
+
+// Function to remove a worker from the list safely
+void remove_worker(RunnerClient *client_to_remove)
 {
-public:
-    void addWorker(const std::string &id, struct bufferevent *bev)
+    std::lock_guard<std::mutex> lock(runner_state.workers_mutex);
+
+    runner_state.workers.erase(
+        std::remove_if(runner_state.workers.begin(), runner_state.workers.end(),
+                       [&](const std::shared_ptr<RunnerClient> &worker_ptr)
+                       {
+                           return worker_ptr.get() == client_to_remove;
+                       }),
+        runner_state.workers.end());
+
+    // Adjust round-robin index if it's now out of bounds
+    if (!runner_state.workers.empty() && runner_state.next_worker_index >= runner_state.workers.size())
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        workers_[id] = {id, bev, false};
-        std::cout << "Worker " << id << " connected" << std::endl;
+        runner_state.next_worker_index = 0; // Reset to start
+    }
+    else if (runner_state.workers.empty())
+    {
+        runner_state.next_worker_index = 0; // Reset if empty
+    }
+    std::cout << "Runner: Worker removed. Remaining workers: " << runner_state.workers.size() << std::endl;
+}
+
+void on_new_connection(uv_stream_t *server, int status)
+{
+    if (status < 0)
+    {
+        fprintf(stderr, "New connection error %s\n", uv_strerror(status));
+        return;
     }
 
-    void removeWorker(const std::string &id)
+    // Ensure server handle matches our runner state server handle
+    if (server != (uv_stream_t *)&runner_state.server_handle)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = workers_.find(id);
-        if (it != workers_.end())
+        fprintf(stderr, "Runner: Mismatched server handle in on_new_connection\n");
+        return;
+    }
+
+    auto client_info = std::make_shared<RunnerClient>();
+    // Initialize the handle within the Runner's loop
+    if (uv_tcp_init(runner_state.loop, &client_info->handle) != 0)
+    {
+        fprintf(stderr, "Runner: Failed to initialize client tcp handle.\n");
+        // Cannot proceed with this client
+        return;
+    }
+    client_info->handle.data = client_info.get(); // Link back to our struct
+
+    if (uv_accept(server, (uv_stream_t *)&client_info->handle) == 0)
+    {
+        std::cout << "Runner: Worker connected." << std::endl;
+        // Add worker to the list under lock
         {
-            bufferevent_free(it->second.bev);
-            std::cout << "Worker " << id << " disconnected" << std::endl;
-            workers_.erase(it);
+            std::lock_guard<std::mutex> lock(runner_state.workers_mutex);
+            runner_state.workers.push_back(client_info);
+            std::cout << "Runner: Worker added. Total workers: " << runner_state.workers.size() << std::endl;
         }
+        // Start reading data from the worker (e.g., registration message)
+        uv_read_start((uv_stream_t *)&client_info->handle, alloc_buffer, on_runner_read);
+    }
+    else
+    {
+        fprintf(stderr, "Runner: Failed to accept worker connection.\n");
+        // Close the handle if accept failed
+        // Use uv_close and provide a callback, even if simple
+        uv_close((uv_handle_t *)&client_info->handle, [](uv_handle_t *handle)
+                 {
+            // Basic cleanup callback for failed accept
+            // The shared_ptr will manage the RunnerClient memory if it goes out of scope
+             std::cout << "Runner: Closed handle for failed accept." << std::endl; });
+    }
+}
+
+void on_runner_read(uv_stream_t *client_stream, ssize_t nread, const uv_buf_t *buf)
+{
+    RunnerClient *client_info = static_cast<RunnerClient *>(client_stream->data);
+    if (!client_info || client_info->closing)
+    {
+        if (buf->base)
+            free(buf->base); // Free buffer even if client is closing
+        return;              // Ignore reads if client is closing or invalid
     }
 
-    void removeWorker(struct bufferevent *bev)
+    if (nread > 0)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = workers_.begin(); it != workers_.end(); ++it)
+        std::cout << "Runner: Received " << nread << " bytes from worker "
+                  << (client_info->id.empty() ? "[unknown]" : client_info->id) << std::endl;
+
+        TaskResult result_msg;
+        WorkerRegister register_msg; // Try parsing as register first
+
+        if (register_msg.ParseFromArray(buf->base, nread))
         {
-            if (it->second.bev == bev)
-            {
-                std::cout << "Worker " << it->first << " disconnected" << std::endl;
-                workers_.erase(it);
-                return;
+            // handle register
+            if (client_info->id.empty())
+            { // Only register once
+                client_info->id = register_msg.worker_id();
+                std::cout << "Runner: Worker registered with ID: " << client_info->id << std::endl;
             }
         }
-    }
-
-    bool getAvailableWorker(Worker &worker)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto &pair : workers_)
+        else if (result_msg.ParseFromArray(buf->base, nread))
         {
-            if (!pair.second.busy)
+            // task result
+            std::cout << "Runner: Received result for task " << result_msg.task_id()
+                      << " from worker " << client_info->id
+                      << ", Success: " << result_msg.success() << std::endl;
+            if (!result_msg.success())
             {
-                worker = pair.second;
-                pair.second.busy = true;
-                return true;
+                std::cerr << "Runner: Task Error from " << client_info->id << ": " << result_msg.error_message() << std::endl;
             }
-        }
-        return false;
-    }
-
-    void markWorkerAvailable(const std::string &id)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = workers_.find(id);
-        if (it != workers_.end())
-        {
-            it->second.busy = false;
-        }
-    }
-
-    size_t size()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return workers_.size();
-    }
-
-    bool hasAvailableWorker()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto &pair : workers_)
-        {
-            if (!pair.second.busy)
-                return true;
-        }
-        return false;
-    }
-
-    // Check if a bev is already registered
-    bool isRegisteredBev(struct bufferevent *bev)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto &pair : workers_)
-        {
-            if (pair.second.bev == bev)
-                return true;
-        }
-        return false;
-    }
-
-private:
-    std::map<std::string, Worker> workers_;
-    std::mutex mutex_;
-};
-
-// Broker server context
-struct BrokerContext
-{
-    TaskQueue taskQueue;
-    WorkerManager workerManager;
-    struct event_base *base;
-};
-
-// Task service for local execution (used by workers)
-class TaskService
-{
-public:
-    TaskService()
-    {
-        // Initialize Lua state
-        L = luaL_newstate();
-        luaL_openlibs(L);
-    }
-
-    ~TaskService()
-    {
-        if (L)
-            lua_close(L);
-    }
-
-    // Execute a Lua function with the given script and arguments
-    std::string executeLuaTask(const std::string &script, const std::string &args)
-    {
-        std::string result;
-
-        // Load and run the script
-        if (luaL_dostring(L, script.c_str()) != 0)
-        {
-            result = "Error loading script: " + std::string(lua_tostring(L, -1));
-            lua_pop(L, 1);
-            return result;
-        }
-
-        // Check if 'execute' function exists
-        lua_getglobal(L, "execute");
-        if (!lua_isfunction(L, -1))
-        {
-            lua_pop(L, 1);
-            return "Error: execute function not found in script";
-        }
-
-        // Push arguments and call function
-        lua_pushstring(L, args.c_str());
-        if (lua_pcall(L, 1, 1, 0) != 0)
-        {
-            result = "Error executing function: " + std::string(lua_tostring(L, -1));
-            lua_pop(L, 1);
-            return result;
-        }
-
-        // Get the result
-        if (lua_isstring(L, -1))
-        {
-            result = lua_tostring(L, -1);
+            // TODO: handle result
         }
         else
         {
-            // Convert non-string results to string representation if possible, or indicate type
-            int type = lua_type(L, -1);
-            result = "Function returned a non-string result (Type: " + std::string(lua_typename(L, type)) + ")";
+            std::cerr << "Runner: Failed to parse message from worker "
+                      << (client_info->id.empty() ? "[unknown]" : client_info->id) << "." << std::endl;
         }
+    }
+    else if (nread < 0)
+    {
+        if (nread != UV_EOF)
+        {
+            fprintf(stderr, "Runner: Read error on worker %s: %s\n",
+                    (client_info->id.empty() ? "[unknown]" : client_info->id.c_str()),
+                    uv_err_name(nread));
+        }
+        else
+        {
+            std::cout << "Runner: Worker " << (client_info->id.empty() ? "[unknown]" : client_info->id) << " sent EOF." << std::endl;
+        }
+        client_info->closing = true;
+        uv_close((uv_handle_t *)client_stream, on_runner_close);
+    }
 
+    if (buf->base)
+    {
+        free(buf->base);
+    }
+}
+
+void on_runner_close(uv_handle_t *handle)
+{
+    RunnerClient *client_info = static_cast<RunnerClient *>(handle->data);
+    if (!client_info)
+        return;
+
+    std::cout << "Runner: Worker " << (client_info->id.empty() ? "[unknown]" : client_info->id) << " connection fully closed." << std::endl;
+
+    remove_worker(client_info);
+}
+struct WriteRequestData
+{
+    uv_write_t req;
+    uv_buf_t buf;
+    std::string data_buffer; // Keep the serialized data alive
+
+    // Prevent copying
+    WriteRequestData(const WriteRequestData &) = delete;
+    WriteRequestData &operator=(const WriteRequestData &) = delete;
+
+    // Constructor to initialize
+    WriteRequestData(const std::string &data) : data_buffer(data)
+    {
+        // Ensure the uv_buf_t points to the string's data
+        buf = uv_buf_init((char *)data_buffer.data(), data_buffer.length());
+        req.data = this; // Point back to this structure
+    }
+};
+
+// Function to send a task to a specific worker
+void send_task_to_worker(RunnerClient *worker, const std::string &task_id, const std::string &script)
+{
+    if (!worker || worker->closing)
+    {
+        std::cerr << "Runner: Attempted to send task to invalid or closing worker." << std::endl;
+        return;
+    }
+
+    TaskRequest task_msg;
+    task_msg.set_task_id(task_id);
+    task_msg.set_script(script);
+    // task_msg.set_input_data(...); // Optional input data
+
+    std::string serialized_task;
+    if (!task_msg.SerializeToString(&serialized_task))
+    {
+        std::cerr << "Runner: Failed to serialize task " << task_id << "." << std::endl;
+        return;
+    }
+
+    // TODO: Implement proper message framing (send size first)
+    // For now, just sending raw protobuf data
+
+    // Create write request data on the heap, managed by the callback
+    WriteRequestData *write_data = new WriteRequestData(serialized_task);
+
+    std::cout << "Runner: Sending task " << task_id << " to worker " << worker->id << std::endl;
+
+    // Perform the write operation
+    int write_status = uv_write(&write_data->req, // Use req from write_data
+                                (uv_stream_t *)&worker->handle,
+                                &write_data->buf, // Use buf from write_data
+                                1,
+                                [](uv_write_t *req, int status)
+                                {
+                                    // Get our data structure back
+                                    WriteRequestData *completed_write_data = static_cast<WriteRequestData *>(req->data);
+
+                                    if (status)
+                                    {
+                                        fprintf(stderr, "Runner: Write error %s\n", uv_strerror(status));
+                                        // Handle write error, maybe close connection?
+                                        RunnerClient *client_info = static_cast<RunnerClient *>(req->handle->data);
+                                        if (client_info && !client_info->closing)
+                                        {
+                                            client_info->closing = true;
+                                            uv_close((uv_handle_t *)req->handle, on_runner_close);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // std::cout << "Runner: Task sent successfully (write callback)." << std::endl;
+                                        //  Write successful, nothing specific to do here for now
+                                    }
+
+                                    // Clean up the WriteRequestData structure now that the write is done
+                                    delete completed_write_data;
+                                });
+
+    if (write_status != 0)
+    {
+        fprintf(stderr, "Runner: uv_write failed immediately for task %s: %s\n", task_id.c_str(), uv_strerror(write_status));
+        // Clean up the allocated data if uv_write failed instantly
+        delete write_data;
+        // Potentially close the connection here too
+        if (!worker->closing)
+        {
+            worker->closing = true;
+            uv_close((uv_handle_t *)&worker->handle, on_runner_close);
+        }
+    }
+}
+
+int run_runner()
+{
+    runner_state.loop = uv_default_loop();
+    if (!runner_state.loop)
+    {
+        fprintf(stderr, "Runner: Failed to get default loop.\n");
+        return 1;
+    }
+
+    // Use the server handle from runner_state
+    uv_tcp_init(runner_state.loop, &runner_state.server_handle);
+    runner_state.server_handle.data = &runner_state; // Optional: link back to state
+
+    struct sockaddr_in bind_addr;
+    uv_ip4_addr(RUNNER_IP, RUNNER_PORT, &bind_addr);
+
+    int bind_ret = uv_tcp_bind(&runner_state.server_handle, (const struct sockaddr *)&bind_addr, 0);
+    if (bind_ret)
+    {
+        fprintf(stderr, "Runner: Bind error %s\n", uv_strerror(bind_ret));
+        uv_close((uv_handle_t *)&runner_state.server_handle, nullptr); // Close handle on error
+        return 1;
+    }
+
+    int listen_ret = uv_listen((uv_stream_t *)&runner_state.server_handle, 128, on_new_connection); // 128 is backlog size
+    if (listen_ret)
+    {
+        fprintf(stderr, "Runner: Listen error %s\n", uv_strerror(listen_ret));
+        uv_close((uv_handle_t *)&runner_state.server_handle, nullptr); // Close handle on error
+        return 1;
+    }
+    std::cout << "Runner: Listening on " << RUNNER_IP << ":" << RUNNER_PORT << std::endl;
+
+    // sample sending tasks
+    // TODO: task queue
+    uv_timer_t task_timer;
+    uv_timer_init(runner_state.loop, &task_timer);
+    task_timer.data = &runner_state;
+
+    uv_timer_start(&task_timer, [](uv_timer_t *handle)
+                   {
+        RunnerState* state = static_cast<RunnerState*>(handle->data);
+        std::lock_guard<std::mutex> lock(state->workers_mutex);
+
+        if (!state->workers.empty()) {
+            // round robin scheduler
+            if (state->next_worker_index >= state->workers.size()) {
+                state->next_worker_index = 0; 
+            }
+
+            std::shared_ptr<RunnerClient> worker = state->workers[state->next_worker_index];
+
+            if (worker && !worker->closing) {
+                static int task_counter = 0;
+                std::string task_id = "task_" + std::to_string(++task_counter);
+                std::string script = "print('Hello from Lua task " + task_id + " on worker " + worker->id + "!') return 'Result for " + task_id + "'";
+                send_task_to_worker(worker.get(), task_id, script);
+
+                state->next_worker_index = (state->next_worker_index + 1) % state->workers.size();
+            }
+
+        } else {
+            std::cout << "no workers available" << std::endl;
+        } }, 5000, 10); // start after 5s
+
+    std::cout << "Runner: Starting event loop..." << std::endl;
+    int run_ret = uv_run(runner_state.loop, UV_RUN_DEFAULT);
+    std::cout << "Runner: Event loop finished with code " << run_ret << std::endl;
+
+    // cleanup
+    uv_close((uv_handle_t *)&runner_state.server_handle, nullptr);
+    uv_run(runner_state.loop, UV_RUN_ONCE);
+
+    return run_ret;
+}
+
+// worker stuff
+uv_loop_t *worker_loop;
+uv_tcp_t worker_socket;
+uv_connect_t worker_connect_req;
+lua_State *L; // Lua state
+std::string worker_id_str;
+
+void on_worker_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
+void on_worker_close(uv_handle_t *handle);
+
+void send_result(uv_stream_t *stream, const TaskResult &result_msg)
+{
+    std::string serialized_result;
+    if (!result_msg.SerializeToString(&serialized_result))
+    {
+        std::cerr << "Worker [" << worker_id_str << "]: Failed to serialize result." << std::endl;
+        return;
+    }
+
+    // TODO: framing
+
+    WriteRequestData *write_data = new WriteRequestData(serialized_result);
+
+    int write_status = uv_write(&write_data->req,
+                                stream,
+                                &write_data->buf,
+                                1,
+                                [](uv_write_t *req, int status)
+                                {
+                                    WriteRequestData *completed_write_data = static_cast<WriteRequestData *>(req->data);
+
+                                    // write error
+                                    if (status)
+                                    {
+                                        fprintf(stderr, "Worker: Write error sending result: %s\n", uv_strerror(status));
+                                        uv_close((uv_handle_t *)req->handle, on_worker_close);
+                                    }
+                                    delete completed_write_data;
+                                });
+
+    if (write_status != 0)
+    {
+        fprintf(stderr, "Worker: uv_write failed immediately for result: %s\n", uv_strerror(write_status));
+        delete write_data;
+        uv_close((uv_handle_t *)stream, on_worker_close); // close on error?
+    }
+}
+
+TaskResult execute_lua_task(const std::string &script)
+{
+    TaskResult result;
+    result.set_success(false);
+
+    if (!L)
+    {
+        result.set_error_message("Lua state not initialized.");
+        return result;
+    }
+
+    // Load and execute the script string
+    int status = luaL_loadstring(L, script.c_str());
+    if (status != LUA_OK)
+    {
+        const char *lua_err = lua_tostring(L, -1);
+        result.set_error_message("Lua load error: " + std::string(lua_err ? lua_err : "Unknown"));
         lua_pop(L, 1);
         return result;
     }
 
-private:
-    lua_State *L;
-};
-
-// Dispatcher thread to match tasks with workers
-void dispatcherThread(BrokerContext *ctx)
-{
-    while (true)
+    status = lua_pcall(L, 0, 1, 0);
+    if (status != LUA_OK)
     {
-        // Wait for an available task
-        PendingTask task;
-        ctx->taskQueue.waitAndPopTask(task);
-
-        // Try to find an available worker
-        Worker worker;
-        bool foundWorker = false;
-
-        // Retry until a worker is available or all workers disconnect
-        while (!foundWorker)
-        {
-            foundWorker = ctx->workerManager.getAvailableWorker(worker);
-            if (!foundWorker)
-            {
-                // If no workers are available, wait a bit and try again
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-                // If still no workers, put task back in queue and break
-                if (ctx->workerManager.size() == 0)
-                {
-                    ctx->taskQueue.pushTask(task); // Put task back for later processing
-                    std::cout << "No workers available, task " << task.task_id << " requeued." << std::endl;
-                    std::this_thread::sleep_for(std::chrono::seconds(1)); // Prevent busy waiting
-                    break;                                                // Exit the inner loop to process the next task
-                }
-            }
-        }
-
-        if (foundWorker)
-        {
-            // Create a task message for the worker
-            task::TaskRequest request;
-            request.set_task_id(task.task_id);
-            request.set_script(task.script);
-            request.set_args(task.args);
-
-            // Add client information to the request for routing response
-            request.set_client_id(std::to_string(reinterpret_cast<uintptr_t>(task.client_bev)));
-
-            // Serialize the request
-            std::string requestStr;
-            if (!request.SerializeToString(&requestStr))
-            {
-                std::cerr << "Failed to serialize worker request for task " << task.task_id << std::endl;
-                ctx->workerManager.markWorkerAvailable(worker.id); // Mark worker available on serialization failure
-                continue;
-            }
-
-            // Send the size first
-            uint32_t requestSize = htonl(requestStr.size());
-            if (bufferevent_write(worker.bev, &requestSize, sizeof(requestSize)) < 0)
-            {
-                std::cerr << "Failed to write task size to worker " << worker.id << std::endl;
-                ctx->workerManager.markWorkerAvailable(worker.id); // Mark worker available on write failure
-                continue;
-            }
-
-            // Send the request
-            if (bufferevent_write(worker.bev, requestStr.c_str(), requestStr.size()) < 0)
-            {
-                std::cerr << "Failed to write task data to worker " << worker.id << std::endl;
-                ctx->workerManager.markWorkerAvailable(worker.id); // Mark worker available on write failure
-                continue;
-            }
-
-            std::cout << "Task " << task.task_id << " assigned to worker " << worker.id << std::endl;
-        }
+        const char *lua_err = lua_tostring(L, -1);
+        result.set_error_message("Lua execution error: " + std::string(lua_err ? lua_err : "Unknown"));
+        lua_pop(L, 1); // Pop error message
+        return result;
     }
-}
 
-// Client read callback for the broker server
-static void brokerClientReadCallback(struct bufferevent *bev, void *ctx)
-{
-    BrokerContext *brokerCtx = static_cast<BrokerContext *>(ctx);
-    struct evbuffer *input = bufferevent_get_input(bev);
-
-    while (true)
+    // check return value
+    if (lua_gettop(L) >= 1)
     {
-        // Read message size
-        uint32_t msgSize;
-        if (evbuffer_copyout(input, &msgSize, sizeof(msgSize)) < sizeof(msgSize))
+        if (lua_isstring(L, -1))
         {
-            return; // Not enough data yet for size
-        }
-
-        msgSize = ntohl(msgSize);
-
-        // Check if we have the complete message
-        if (evbuffer_get_length(input) < sizeof(msgSize) + msgSize)
-        {
-            return; // Wait for more data
-        }
-
-        // Remove the size field
-        evbuffer_drain(input, sizeof(msgSize));
-
-        // Read the protobuf message
-        std::unique_ptr<char[]> data(new char[msgSize]);
-        evbuffer_remove(input, data.get(), msgSize);
-
-        // Parse the task request
-        task::TaskRequest request;
-        if (!request.ParseFromArray(data.get(), msgSize))
-        {
-            std::cerr << "Failed to parse client request" << std::endl;
-            // Continue processing in case there's more valid data
-            continue;
-        }
-
-        // Add the task to the queue
-        PendingTask task;
-        task.task_id = request.task_id();
-        task.script = request.script();
-        task.args = request.args();
-        task.client_bev = bev; // Store the client's bufferevent
-
-        brokerCtx->taskQueue.pushTask(task);
-
-        std::cout << "Task " << task.task_id << " received from client, queued for processing" << std::endl;
-    }
-}
-
-static void brokerWorkerReadCallback(struct bufferevent *bev, void *ctx)
-{
-    BrokerContext *brokerCtx = static_cast<BrokerContext *>(ctx);
-    struct evbuffer *input = bufferevent_get_input(bev);
-
-    while (true)
-    {
-        uint32_t msgSize;
-        if (evbuffer_copyout(input, &msgSize, sizeof(msgSize)) < sizeof(msgSize))
-            return;
-        msgSize = ntohl(msgSize);
-        if (evbuffer_get_length(input) < sizeof(msgSize) + msgSize)
-            return;
-        evbuffer_drain(input, sizeof(msgSize));
-
-        std::unique_ptr<char[]> data(new char[msgSize]);
-        evbuffer_remove(input, data.get(), msgSize);
-
-        bool registered = brokerCtx->workerManager.isRegisteredBev(bev);
-
-        if (!registered)
-        {
-            // Expecting WorkerRegistration
-            task::WorkerRegistration reg;
-            if (reg.ParseFromArray(data.get(), msgSize))
-            {
-                brokerCtx->workerManager.addWorker(reg.worker_id(), bev);
-
-                // Send acknowledgment
-                task::WorkerAcknowledgment ack;
-                ack.set_worker_id(reg.worker_id());
-                ack.set_status("registered");
-                std::string ackStr;
-                if (ack.SerializeToString(&ackStr))
-                {
-                    uint32_t ackSize = htonl(ackStr.size());
-                    bufferevent_write(bev, &ackSize, sizeof(ackSize));
-                    bufferevent_write(bev, ackStr.c_str(), ackStr.size());
-                }
-            }
-            else
-            {
-                std::cerr << "Invalid registration from worker" << std::endl;
-            }
+            size_t len;
+            const char *lua_res = lua_tolstring(L, -1, &len); // Use tolstring for length
+            result.set_output(lua_res ? lua_res : "", len);   // Set result data
         }
         else
         {
-            // Handle TaskResponse
-            task::TaskResponse response;
-            if (response.ParseFromArray(data.get(), msgSize))
-            {
-                // Mark worker available again
-                std::string workerId = response.worker_id();
-                brokerCtx->workerManager.markWorkerAvailable(workerId);
-
-                // Forward to client
-                uintptr_t clientId = std::stoull(response.client_id());
-                struct bufferevent *clientBev = reinterpret_cast<struct bufferevent *>(clientId);
-
-                task::TaskResponse clientResp;
-                clientResp.set_task_id(response.task_id());
-                clientResp.set_result(response.result());
-                std::string respStr;
-                if (clientResp.SerializeToString(&respStr))
-                {
-                    uint32_t respSize = htonl(respStr.size());
-                    bufferevent_write(clientBev, &respSize, sizeof(respSize));
-                    bufferevent_write(clientBev, respStr.c_str(), respStr.size());
-                }
-                std::cout << "Task " << response.task_id() << " completed by worker "
-                          << workerId << ", result sent to client" << std::endl;
-            }
-            else
-            {
-                std::cerr << "Unknown message type from worker" << std::endl;
-            }
+            // TODO: Handle diff. return types
+            result.set_error_message("Lua script returned non-string value.");
+            lua_pop(L, 1);
+            return result;
         }
-    }
-}
-// Event callback for clients and workers
-static void brokerEventCallback(struct bufferevent *bev, short events, void *ctx)
-{
-    BrokerContext *brokerCtx = static_cast<BrokerContext *>(ctx);
-
-    if (events & BEV_EVENT_ERROR)
-    {
-        int err = EVUTIL_SOCKET_ERROR();
-        std::cerr << "Error from bufferevent: " << evutil_socket_error_to_string(err) << std::endl;
+        lua_pop(L, 1);
     }
 
-    if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR))
-    {
-        brokerCtx->workerManager.removeWorker(bev); // Attempt to remove as worker
-        // If not a worker, it's likely a client, and bufferevent_free handles cleanup.
-        bufferevent_free(bev);
-    }
+    result.set_success(true);
+    return result;
 }
 
-// Accept callback for the broker server (for clients)
-static void brokerAcceptCallback(struct evconnlistener *listener, evutil_socket_t fd,
-                                 struct sockaddr *address, int socklen, void *ctx)
+void on_worker_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
 {
-    BrokerContext *brokerCtx = static_cast<BrokerContext *>(ctx);
-    struct event_base *base = evconnlistener_get_base(listener);
-
-    // Set up the bufferevent for the new connection
-    struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
-    if (!bev)
+    if (nread > 0)
     {
-        std::cerr << "Error constructing bufferevent for client connection" << std::endl;
-        evutil_closesocket(fd);
-        return;
-    }
 
-    // This is a client connection. Set the client read callback.
-    bufferevent_setcb(bev, brokerClientReadCallback, NULL, brokerEventCallback, brokerCtx);
-    bufferevent_enable(bev, EV_READ | EV_WRITE);
+        // TODO: framing
 
-    std::cout << "Accepted client connection on fd " << fd << std::endl;
-}
-
-// Accept callback for worker registration
-static void workerAcceptCallback(struct evconnlistener *listener, evutil_socket_t fd,
-                                 struct sockaddr *address, int socklen, void *ctx)
-{
-    BrokerContext *brokerCtx = static_cast<BrokerContext *>(ctx);
-    struct event_base *base = evconnlistener_get_base(listener);
-
-    // Set up the bufferevent for the new connection
-    struct bufferevent *bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
-    if (!bev)
-    {
-        std::cerr << "Error constructing bufferevent for worker connection" << std::endl;
-        evutil_closesocket(fd);
-        return;
-    }
-
-    // This is a worker connection. Set the worker read callback.
-    bufferevent_setcb(bev, brokerWorkerReadCallback, NULL, brokerEventCallback, brokerCtx);
-    bufferevent_enable(bev, EV_READ | EV_WRITE);
-
-    std::cout << "Accepted worker connection" << std::endl;
-}
-
-// Worker context for task execution
-struct WorkerContext
-{
-    std::string worker_id;
-    TaskService service;
-    struct event_base *base;
-    struct bufferevent *broker_bev;
-    bool registered{false};
-};
-
-// Read callback for worker
-static void workerReadCallback(struct bufferevent *bev, void *ctx)
-{
-    WorkerContext *workerCtx = static_cast<WorkerContext *>(ctx);
-    struct evbuffer *input = bufferevent_get_input(bev);
-
-    while (true)
-    {
-        // 1) Read the 4-byte size prefix
-        uint32_t netMsgSize;
-        if (evbuffer_copyout(input, &netMsgSize, sizeof(netMsgSize)) < sizeof(netMsgSize))
-            return; // not enough data yet
-        uint32_t msgSize = ntohl(netMsgSize);
-
-        // 2) Wait until the full payload is available
-        if (evbuffer_get_length(input) < sizeof(netMsgSize) + msgSize)
-            return;
-        evbuffer_drain(input, sizeof(netMsgSize));
-
-        // 3) Extract the payload
-        std::unique_ptr<char[]> data(new char[msgSize]);
-        evbuffer_remove(input, data.get(), msgSize);
-
-        if (!workerCtx->registered)
+        TaskRequest task_msg;
+        if (task_msg.ParseFromArray(buf->base, nread))
         {
-            // -- Registration handshake --
-            task::WorkerAcknowledgment ack;
-            if (ack.ParseFromArray(data.get(), msgSize))
-            {
-                workerCtx->registered = true;
-                std::cout << "Worker " << ack.worker_id()
-                          << " status: " << ack.status() << std::endl;
-            }
-            else
-            {
-                std::cerr << "Expected WorkerAcknowledgment but failed to parse." << std::endl;
-            }
+            std::cout << "Worker [" << worker_id_str << "]: Received task " << task_msg.task_id() << std::endl;
+
+            // execution
+            TaskResult result = execute_lua_task(task_msg.script());
+            result.set_task_id(task_msg.task_id());
+            send_result(stream, result);
         }
         else
         {
-            // -- Actual task dispatch --
-            task::TaskRequest request;
-            if (request.ParseFromArray(data.get(), msgSize))
-            {
-                std::cout << "Worker " << workerCtx->worker_id
-                          << " received task " << request.task_id() << std::endl;
-
-                // Execute the Lua script
-                std::string result = workerCtx->service.executeLuaTask(
-                    request.script(), request.args());
-
-                // Build response
-                task::TaskResponse response;
-                response.set_task_id(request.task_id());
-                response.set_result(result);
-                response.set_worker_id(workerCtx->worker_id);
-                response.set_client_id(request.client_id());
-
-                std::string out;
-                if (!response.SerializeToString(&out))
-                {
-                    std::cerr << "Failed to serialize TaskResponse for task "
-                              << request.task_id() << std::endl;
-                    return;
-                }
-
-                // Send size + payload back to broker
-                uint32_t outSize = htonl(out.size());
-                if (bufferevent_write(bev, &outSize, sizeof(outSize)) < 0 ||
-                    bufferevent_write(bev, out.c_str(), out.size()) < 0)
-                {
-                    std::cerr << "Failed to send TaskResponse for task "
-                              << request.task_id() << std::endl;
-                }
-                else
-                {
-                    std::cout << "Worker " << workerCtx->worker_id
-                              << " sent result for task " << request.task_id() << std::endl;
-                }
-            }
-            else
-            {
-                std::cerr << "Expected TaskRequest after registration but failed to parse." << std::endl;
-            }
+            std::cerr << "Worker [" << worker_id_str << "]: Failed to parse message from runner." << std::endl;
+            // Close connection on parse failure?
+            uv_close((uv_handle_t *)stream, on_worker_close);
         }
+    }
+    else if (nread < 0)
+    {
+        if (nread != UV_EOF)
+        {
+            fprintf(stderr, "Worker [%s]: Read error %s\n", worker_id_str.c_str(), uv_err_name(nread));
+        }
+        uv_close((uv_handle_t *)stream, on_worker_close);
+    }
+
+    if (buf->base)
+    {
+        free(buf->base);
     }
 }
 
-// Event callback for worker
-static void workerEventCallback(struct bufferevent *bev, short events, void *ctx)
+void on_worker_close(uv_handle_t *handle)
 {
-    WorkerContext *workerCtx = static_cast<WorkerContext *>(ctx);
-
-    if (events & BEV_EVENT_ERROR)
+    std::cout << "Worker [" << worker_id_str << "]: Connection closed." << std::endl;
+    if (L)
     {
-        int err = EVUTIL_SOCKET_ERROR();
-        std::cerr << "Error from bufferevent: " << evutil_socket_error_to_string(err) << std::endl;
-    }
-    if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT))
-    {
-        std::cerr << "Connection to broker closed. Exiting worker." << std::endl;
-        event_base_loopexit(bufferevent_get_base(bev), NULL); // Exit the worker's event loop
-    }
-    if (events & BEV_EVENT_CONNECTED)
-    {
-        std::cout << "Worker connected successfully to broker." << std::endl;
-
-        // === ADD THIS SECTION ===
-        // Send Worker Registration message
-        task::WorkerRegistration reg;
-        reg.set_worker_id(workerCtx->worker_id); // Use the worker's ID
-
-        std::string regStr;
-        if (!reg.SerializeToString(&regStr))
-        {
-            std::cerr << "Failed to serialize worker registration message" << std::endl;
-            // Handle error, possibly disconnect
-            bufferevent_free(bev);
-            event_base_loopexit(bufferevent_get_base(bev), NULL);
-            return;
-        }
-
-        // Send the size first
-        uint32_t regSize = htonl(regStr.size());
-        if (bufferevent_write(bev, &regSize, sizeof(regSize)) < 0)
-        {
-            std::cerr << "Failed to write registration size to broker." << std::endl;
-            // Handle error, possibly disconnect
-            bufferevent_free(bev);
-            event_base_loopexit(bufferevent_get_base(bev), NULL);
-            return;
-        }
-
-        // Send the registration message
-        if (bufferevent_write(bev, regStr.c_str(), regStr.size()) < 0)
-        {
-            std::cerr << "Failed to write registration data to broker." << std::endl;
-            // Handle error, possibly disconnect
-            bufferevent_free(bev);
-            event_base_loopexit(bufferevent_get_base(bev), NULL);
-            return;
-        }
-        // === END OF ADDED SECTION ===
-
-        // Connection established, set the main read/write callbacks
-        bufferevent_setcb(bev, workerReadCallback, NULL, workerEventCallback, ctx);
-        bufferevent_enable(bev, EV_READ | EV_WRITE);
+        lua_close(L);
+        L = nullptr;
+        std::cout << "Worker [" << worker_id_str << "]: Lua state closed." << std::endl;
     }
 }
 
-// Client implementation
-class TaskClient
+void on_worker_connect(uv_connect_t *req, int status)
 {
-public:
-    TaskClient(const std::string &host, int port)
-        : host_(host), port_(port), base_(nullptr), bev_(nullptr) {}
-
-    ~TaskClient()
+    if (status < 0)
     {
-        // bufferevent_free also frees the associated socket
-        if (bev_)
-            bufferevent_free(bev_);
-        if (base_)
-            event_base_free(base_);
-        // Clean up Protocol Buffers library
-        google::protobuf::ShutdownProtobufLibrary();
-    }
-
-    bool connect()
-    {
-        // Create event base
-        base_ = event_base_new();
-        if (!base_)
-        {
-            std::cerr << "Could not create event base" << std::endl;
-            return false;
-        }
-
-        // Create bufferevent for connection
-        bev_ = bufferevent_socket_new(base_, -1, BEV_OPT_CLOSE_ON_FREE);
-        if (!bev_)
-        {
-            std::cerr << "Could not create bufferevent" << std::endl;
-            event_base_free(base_); // Clean up base if bufferevent creation fails
-            base_ = nullptr;
-            return false;
-        }
-
-        // Connect to server
-        struct sockaddr_in sin;
-        memset(&sin, 0, sizeof(sin));
-        sin.sin_family = AF_INET;
-        sin.sin_port = htons(port_);
-        if (evutil_inet_pton(AF_INET, host_.c_str(), &sin.sin_addr) <= 0)
-        {
-            std::cerr << "Invalid address: " << host_ << std::endl;
-            bufferevent_free(bev_);
-            bev_ = nullptr;
-            event_base_free(base_);
-            base_ = nullptr;
-            return false;
-        }
-
-        // Set initial callbacks for connection event
-        bufferevent_setcb(bev_, NULL, NULL, clientEventCallback, this);
-
-        if (bufferevent_socket_connect(bev_, (struct sockaddr *)&sin, sizeof(sin)) < 0)
-        {
-            std::cerr << "Error connecting to server at " << host_ << ":" << port_ << std::endl;
-            bufferevent_free(bev_); // Clean up bufferevent on connection failure
-            bev_ = nullptr;
-            event_base_free(base_); // Clean up base on connection failure
-            base_ = nullptr;
-            return false;
-        }
-
-        // Enable read/write events after initiating connect.
-        // The BEV_EVENT_CONNECTED will be reported when connection is established.
-        bufferevent_enable(bev_, EV_READ | EV_WRITE);
-
-        // Wait for the connection to be established
-        // This is a simple blocking wait for the client example.
-        // A real-world client might use a non-blocking approach.
-        // We wait for the BEV_EVENT_CONNECTED event in the callback to signal success.
-        std::cout << "Attempting to connect to " << host_ << ":" << port_ << std::endl;
-        event_base_dispatch(base_); // Run the loop until event_base_loopexit is called in callback
-
-        std::cout << "Connected to broker server." << std::endl;
-
-        return true;
-    }
-
-    void submitTask(const std::string &script, const std::string &args, const std::string &taskId)
-    {
-        if (!bev_ || !base_)
-        {
-            std::cerr << "Client not connected." << std::endl;
-            return;
-        }
-
-        // Create task request
-        task::TaskRequest request;
-        request.set_script(script);
-        request.set_args(args);
-        request.set_task_id(taskId);
-        // client_id is not needed for client-to-broker request, broker will set it
-
-        // Serialize the request
-        std::string requestStr;
-        if (!request.SerializeToString(&requestStr))
-        {
-            std::cerr << "Failed to serialize request" << std::endl;
-            return;
-        }
-
-        // Send the size first
-        uint32_t requestSize = htonl(requestStr.size());
-        if (bufferevent_write(bev_, &requestSize, sizeof(requestSize)) < 0)
-        {
-            std::cerr << "Failed to write request size to server." << std::endl;
-            // Consider re-connecting or handling the error appropriately
-            return;
-        }
-
-        // Send the request
-        if (bufferevent_write(bev_, requestStr.c_str(), requestStr.size()) < 0)
-        {
-            std::cerr << "Failed to write request data to server." << std::endl;
-            // Consider re-connecting or handling the error appropriately
-            return;
-        }
-
-        // Set callback to read response
-        bufferevent_setcb(bev_, clientReadCallback, NULL, clientEventCallback, this);
-        bufferevent_enable(bev_, EV_READ); // Ensure read is enabled for the response
-
-        // Run the event loop to wait for the response
-        event_base_dispatch(base_); // Loop until a response is received or error occurs
-    }
-
-private:
-    static void clientReadCallback(struct bufferevent *bev, void *ctx)
-    {
-        struct evbuffer *input = bufferevent_get_input(bev);
-
-        while (true)
-        {
-            // Read message size
-            uint32_t msgSize;
-            if (evbuffer_copyout(input, &msgSize, sizeof(msgSize)) < sizeof(msgSize))
-            {
-                return; // Not enough data yet for size
-            }
-
-            msgSize = ntohl(msgSize);
-
-            // Check if we have the complete message
-            if (evbuffer_get_length(input) < sizeof(msgSize) + msgSize)
-            {
-                return; // Wait for more data
-            }
-
-            // Remove the size field
-            evbuffer_drain(input, sizeof(msgSize));
-
-            // Read the protobuf message
-            std::unique_ptr<char[]> data(new char[msgSize]);
-            evbuffer_remove(input, data.get(), msgSize);
-
-            // Parse the task response
-            task::TaskResponse response;
-            if (response.ParseFromArray(data.get(), msgSize))
-            {
-                std::cout << "Task " << response.task_id() << " completed: " << response.result() << std::endl;
-            }
-            else
-            {
-                std::cerr << "Failed to parse response" << std::endl;
-            }
-
-            // Exit the event loop after receiving a response
-            event_base_loopexit(bufferevent_get_base(bev), NULL);
-            return; // Process only one response per submission in this simple client
-        }
-    }
-
-    static void clientEventCallback(struct bufferevent *bev, short events, void *ctx)
-    {
-        TaskClient *client = static_cast<TaskClient *>(ctx);
-
-        if (events & BEV_EVENT_ERROR)
-        {
-            int err = EVUTIL_SOCKET_ERROR();
-            std::cerr << "Error from bufferevent: " << evutil_socket_error_to_string(err) << std::endl;
-        }
-        if (events & (BEV_EVENT_EOF | BEV_EVENT_ERROR | BEV_EVENT_TIMEOUT))
-        {
-            if (events & BEV_EVENT_EOF)
-            {
-                std::cerr << "Connection closed by server." << std::endl;
-            }
-            else if (events & BEV_EVENT_TIMEOUT)
-            {
-                std::cerr << "Connection timed out." << std::endl;
-            }
-            // Mark bufferevent and base as null before exiting loop, as they will be freed
-            client->bev_ = nullptr;
-            client->base_ = nullptr;
-            event_base_loopexit(bufferevent_get_base(bev), NULL); // Exit the client's event loop
-        }
-        if (events & BEV_EVENT_CONNECTED)
-        {
-            std::cout << "Client connected successfully." << std::endl;
-            // Connection established, the connect attempt loop can exit
-            event_base_loopexit(bufferevent_get_base(bev), NULL);
-        }
-    }
-
-    std::string host_;
-    int port_;
-    struct event_base *base_;
-    struct bufferevent *bev_;
-};
-
-// Run the broker server
-void runBroker(int clientPort, int workerPort)
-{
-    BrokerContext ctx;
-    struct evconnlistener *clientListener;
-    struct evconnlistener *workerListener;
-    struct sockaddr_in clientSin, workerSin;
-
-    // Initialize event base
-    ctx.base = event_base_new();
-    if (!ctx.base)
-    {
-        std::cerr << "Could not create event base" << std::endl;
+        fprintf(stderr, "Worker: Connection error %s\n", uv_strerror(status));
+        // TODO: retry
+        on_worker_close((uv_handle_t *)&worker_socket);
         return;
     }
 
-    // Set up the address for client connections
-    memset(&clientSin, 0, sizeof(clientSin));
-    clientSin.sin_family = AF_INET;
-    clientSin.sin_addr.s_addr = htonl(INADDR_ANY);
-    clientSin.sin_port = htons(clientPort);
+    std::cout << "Worker: Connected to runner." << std::endl;
 
-    // Create the client listener
-    clientListener = evconnlistener_new_bind(
-        ctx.base, brokerAcceptCallback, &ctx,
-        LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, -1,
-        (struct sockaddr *)&clientSin, sizeof(clientSin));
+    WorkerRegister register_msg;
 
-    if (!clientListener)
+    char hostname[256];
+    size_t size = sizeof(hostname);
+    if (uv_os_gethostname(hostname, &size) != 0)
     {
-        std::cerr << "Could not create client listener on port " << clientPort << std::endl;
-        event_base_free(ctx.base);
-        return;
+        strncpy(hostname, "unknown_host", sizeof(hostname) - 1);
+        hostname[sizeof(hostname) - 1] = '\0';
     }
+    worker_id_str = std::string(hostname) + ":" + std::to_string(uv_os_getpid());
+    register_msg.set_worker_id(worker_id_str);
 
-    // Set up the address for worker connections
-    memset(&workerSin, 0, sizeof(workerSin));
-    workerSin.sin_family = AF_INET;
-    workerSin.sin_addr.s_addr = htonl(INADDR_ANY);
-    workerSin.sin_port = htons(workerPort);
-
-    // Create the worker listener
-    workerListener = evconnlistener_new_bind(
-        ctx.base, workerAcceptCallback, &ctx,
-        LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, -1,
-        (struct sockaddr *)&workerSin, sizeof(workerSin));
-
-    if (!workerListener)
+    std::string serialized_reg;
+    if (!register_msg.SerializeToString(&serialized_reg))
     {
-        std::cerr << "Could not create worker listener on port " << workerPort << std::endl;
-        evconnlistener_free(clientListener);
-        event_base_free(ctx.base);
-        return;
-    }
-
-    // Start the dispatcher thread
-    std::thread dispatcher(dispatcherThread, &ctx);
-    dispatcher.detach(); // Detach the thread to run independently
-
-    std::cout << "Broker server running on port " << clientPort << " for clients and port "
-              << workerPort << " for workers" << std::endl;
-
-    // Run the event loop
-    event_base_dispatch(ctx.base);
-
-    std::cout << "Broker server shutting down." << std::endl;
-
-    // Clean up
-    evconnlistener_free(clientListener);
-    evconnlistener_free(workerListener);
-    event_base_free(ctx.base);
-
-    // Note: The dispatcher thread is detached, it might still be running.
-    // For a clean shutdown, you might need a mechanism to signal the thread to exit.
-}
-
-// Run a worker node
-void runWorker(const std::string &brokerId, int brokerPort, const std::string &workerId)
-{
-    WorkerContext ctx;
-    ctx.worker_id = workerId;
-
-    // Initialize event base
-    ctx.base = event_base_new();
-    if (!ctx.base)
-    {
-        std::cerr << "Could not create event base" << std::endl;
-        return;
-    }
-
-    // Create bufferevent for connection to broker
-    ctx.broker_bev = bufferevent_socket_new(ctx.base, -1, BEV_OPT_CLOSE_ON_FREE);
-    if (!ctx.broker_bev)
-    {
-        std::cerr << "Could not create bufferevent" << std::endl;
-        event_base_free(ctx.base);
-        return;
-    }
-
-    // Connect to broker
-    struct sockaddr_in sin;
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(brokerPort);
-    if (evutil_inet_pton(AF_INET, brokerId.c_str(), &sin.sin_addr) <= 0)
-    {
-        std::cerr << "Invalid broker address: " << brokerId << std::endl;
-        bufferevent_free(ctx.broker_bev);
-        event_base_free(ctx.base);
-        return;
-    }
-
-    // Set initial callbacks for connection event
-    bufferevent_setcb(ctx.broker_bev, NULL, NULL, workerEventCallback, &ctx);
-
-    if (bufferevent_socket_connect(ctx.broker_bev, (struct sockaddr *)&sin, sizeof(sin)) < 0)
-    {
-        std::cerr << "Error connecting to broker at " << brokerId << ":" << brokerPort << std::endl;
-        bufferevent_free(ctx.broker_bev);
-        event_base_free(ctx.base);
-        return;
-    }
-
-    // Enable read/write events after initiating connect.
-    // The BEV_EVENT_CONNECTED will be reported when connection is established.
-    bufferevent_enable(ctx.broker_bev, EV_READ | EV_WRITE);
-
-    // Wait for the connection to be established
-    // We wait for the BEV_EVENT_CONNECTED event in the callback to signal success.
-    std::cout << "Worker " << workerId << " attempting to connect to broker at " << brokerId << ":" << brokerPort << std::endl;
-    event_base_dispatch(ctx.base); // Loop until event_base_loopexit is called in callback
-
-    std::cout << "Worker " << workerId << " connected successfully to broker." << std::endl;
-
-    // Register with broker
-    task::WorkerRegistration reg;
-    reg.set_worker_id(workerId);
-
-    std::string regStr;
-    if (!reg.SerializeToString(&regStr))
-    {
-        std::cerr << "Failed to serialize worker registration" << std::endl;
-        // If serialization fails, the connection is likely still open but unusable for registration
-        // Clean up and exit worker.
-        bufferevent_free(ctx.broker_bev);
-        ctx.broker_bev = nullptr;
-        event_base_free(ctx.base);
-        ctx.base = nullptr;
-        return;
-    }
-
-    // Send the size first
-    uint32_t regSize = htonl(regStr.size());
-    if (bufferevent_write(ctx.broker_bev, &regSize, sizeof(regSize)) < 0)
-    {
-        std::cerr << "Failed to write registration size to broker." << std::endl;
-        // Clean up and exit worker on write failure
-        bufferevent_free(ctx.broker_bev);
-        ctx.broker_bev = nullptr;
-        event_base_free(ctx.base);
-        ctx.base = nullptr;
-        return;
-    }
-
-    // Send the registration
-    if (bufferevent_write(ctx.broker_bev, regStr.c_str(), regStr.size()) < 0)
-    {
-        std::cerr << "Failed to write registration data to broker." << std::endl;
-        // Clean up and exit worker on write failure
-        bufferevent_free(ctx.broker_bev);
-        ctx.broker_bev = nullptr;
-        event_base_free(ctx.base);
-        ctx.base = nullptr;
-        return;
-    }
-
-    // The workerReadCallback is already set and enabled after successful connection.
-    // It will handle the registration acknowledgment and subsequent task requests.
-
-    // Run the event loop to process messages from the broker
-    event_base_dispatch(ctx.base);
-
-    std::cout << "Worker " << workerId << " shutting down." << std::endl;
-
-    // Clean up is handled by the event loop exiting and BEV_OPT_CLOSE_ON_FREE
-    // If base_ and broker_bev_ are not null, free them
-    if (ctx.broker_bev)
-        bufferevent_free(ctx.broker_bev);
-    if (ctx.base)
-        event_base_free(ctx.base);
-}
-
-// Example usage
-int main(int argc, char **argv)
-{
-    // Initialize Protocol Buffers
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
-
-    if (argc < 2)
-    {
-        std::cerr << "Usage: " << argv[0] << " [broker CLIENT_PORT WORKER_PORT | worker MASTER_HOST MASTER_PORT WORKER_ID | client HOST PORT]" << std::endl;
-        return 1;
-    }
-
-    std::string mode = argv[1];
-
-    if (mode == "broker")
-    {
-        if (argc != 4)
-        {
-            std::cerr << "Usage: " << argv[0] << " broker CLIENT_PORT WORKER_PORT" << std::endl;
-            google::protobuf::ShutdownProtobufLibrary();
-            return 1;
-        }
-        int clientPort = std::stoi(argv[2]);
-        int workerPort = std::stoi(argv[3]);
-        runBroker(clientPort, workerPort);
-    }
-    else if (mode == "worker")
-    {
-        if (argc != 5)
-        {
-            std::cerr << "Usage: " << argv[0] << " worker MASTER_HOST MASTER_PORT WORKER_ID" << std::endl;
-            google::protobuf::ShutdownProtobufLibrary();
-            return 1;
-        }
-        std::string brokerHost = argv[2];
-        int brokerPort = std::stoi(argv[3]);
-        std::string workerId = argv[4];
-        runWorker(brokerHost, brokerPort, workerId);
-    }
-    else if (mode == "client")
-    {
-        if (argc != 4)
-        {
-            std::cerr << "Usage: " << argv[0] << " client HOST PORT" << std::endl;
-            google::protobuf::ShutdownProtobufLibrary();
-            return 1;
-        }
-        std::string host = argv[2];
-        int port = std::stoi(argv[3]);
-
-        TaskClient client(host, port);
-        if (!client.connect())
-        {
-            google::protobuf::ShutdownProtobufLibrary();
-            return 1;
-        }
-
-        std::string script = "function execute(args) return tostring(9+10) end";
-        std::string args = "test";
-        std::string taskId = "task0";
-
-        client.submitTask(script, args, taskId);
+        std::cerr << "Worker [" << worker_id_str << "]: Failed to serialize registration." << std::endl;
+        uv_close((uv_handle_t *)req->handle, on_worker_close); // Close if cannot register
     }
     else
     {
-        std::cerr << "Usage: " << argv[0] << " [broker CLIENT_PORT WORKER_PORT | worker MASTER_HOST MASTER_PORT WORKER_ID | client HOST PORT]" << std::endl;
-        google::protobuf::ShutdownProtobufLibrary();
+        WriteRequestData *write_data = new WriteRequestData(serialized_reg);
+
+        int write_status = uv_write(&write_data->req,
+                                    req->handle,
+                                    &write_data->buf,
+                                    1,
+                                    [](uv_write_t *wreq, int wstatus)
+                                    {
+                                        WriteRequestData *completed_write_data = static_cast<WriteRequestData *>(wreq->data);
+                                        if (wstatus)
+                                        {
+                                            fprintf(stderr, "Worker: Registration write error %s\n", uv_strerror(wstatus));
+                                            uv_close((uv_handle_t *)wreq->handle, on_worker_close); // Close on error
+                                        }
+                                        else
+                                        {
+                                            std::cout << "Worker [" << worker_id_str << "]: Registration sent." << std::endl;
+                                            // read after registration
+                                            uv_read_start(wreq->handle, alloc_buffer, on_worker_read);
+                                        }
+                                        delete completed_write_data; // clean up
+                                    });
+
+        if (write_status != 0)
+        {
+            fprintf(stderr, "Worker: uv_write failed immediately for registration: %s\n", uv_strerror(write_status));
+            delete write_data;
+            uv_close((uv_handle_t *)req->handle, on_worker_close);
+        }
+    }
+}
+
+int run_worker()
+{
+    worker_loop = uv_default_loop();
+    if (!worker_loop)
+    {
+        fprintf(stderr, "Worker: Failed to get default loop.\n");
         return 1;
     }
 
-    return 0;
+    // Initialize Lua state
+    L = luaL_newstate();
+    if (!L)
+    {
+        std::cerr << "Worker: Failed to create Lua state." << std::endl;
+        return 1;
+    }
+    luaL_openlibs(L);
+
+    uv_tcp_init(worker_loop, &worker_socket);
+    worker_socket.data = nullptr;
+
+    struct sockaddr_in dest_addr;
+    uv_ip4_addr(WORKER_TARGET_IP, RUNNER_PORT, &dest_addr);
+
+    std::cout << "Worker: Attempting to connect to " << WORKER_TARGET_IP << ":" << RUNNER_PORT << std::endl;
+    uv_tcp_connect(&worker_connect_req, &worker_socket, (const struct sockaddr *)&dest_addr, on_worker_connect);
+
+    int ret = uv_run(worker_loop, UV_RUN_DEFAULT);
+    std::cout << "Worker [" << worker_id_str << "]: Event loop finished." << std::endl;
+
+    if (L)
+    {
+        lua_close(L);
+        L = nullptr;
+    }
+
+    return ret;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && std::string(argv[1]) == "--worker")
+    {
+        std::cout << "starting worker..." << std::endl;
+        GOOGLE_PROTOBUF_VERIFY_VERSION;
+        int ret = run_worker();
+        google::protobuf::ShutdownProtobufLibrary();
+        return ret;
+    }
+    else
+    {
+        std::cout << "starting task runner..." << std::endl;
+        // Initialize Protobuf library
+        GOOGLE_PROTOBUF_VERIFY_VERSION;
+        int ret = run_runner();
+        google::protobuf::ShutdownProtobufLibrary();
+        return ret;
+    }
 }
